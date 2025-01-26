@@ -1,8 +1,10 @@
 import streamlit as st
+import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from datasets import load_dataset
-import pandas as pd
 from rouge_score import rouge_scorer
+from concurrent.futures import ThreadPoolExecutor
+
 
 # Load model and tokenizer
 model = AutoModelForSeq2SeqLM.from_pretrained("./fine_tuned_model")
@@ -11,12 +13,31 @@ tokenizer = AutoTokenizer.from_pretrained("./fine_tuned_model")
 # Load test dataset
 ds = load_dataset("abisee/cnn_dailymail", "3.0.0")
 df_test = ds['test'].to_pandas()
+df_test = df_test.sample(100, random_state=42)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = model.to(device)
 
 # Summarization function
 def summarize(text):
     inputs = tokenizer(f"summarize: {text}", return_tensors="pt", max_length=512, truncation=True)
     outputs = model.generate(input_ids=inputs['input_ids'], max_length=150)
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+# Update summarize function
+def summarize_batch(texts, batch_size=8):
+    summaries = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+
+        # Tokenize and move tensors to the correct device
+        inputs = tokenizer(batch, return_tensors="pt", max_length=512, truncation=True, padding=True)
+        inputs = {key: value.to(device) for key, value in inputs.items()}  # Move tensors to device
+
+        # Generate summaries
+        outputs = model.generate(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask'], max_length=150)
+        summaries.extend(tokenizer.batch_decode(outputs, skip_special_tokens=True))
+
+    return summaries
 
 # Compute ROUGE scores
 def compute_rouge(predictions, references):
@@ -39,13 +60,24 @@ def compute_rouge(predictions, references):
     }
 
 # Evaluation function
-def evaluate_model():
-    predictions = []
+def evaluate_model(df_test, batch_size=16):
     references = df_test["highlights"].tolist()
+    articles = df_test["article"].tolist()
 
-    for article in df_test["article"]:
-        summary = summarize(article)
-        predictions.append(summary)
+    predictions = []
+    progress_bar = st.progress(0)
+    total_batches = (len(articles) + batch_size - 1) // batch_size
+
+    def process_batch(start_idx):
+        batch = articles[start_idx:start_idx + batch_size]
+        return summarize_batch(batch, batch_size)
+
+    # Parallelize batch processing
+    with ThreadPoolExecutor() as executor:
+        futures = [executor.submit(process_batch, i) for i in range(0, len(articles), batch_size)]
+        for idx, future in enumerate(futures):
+            predictions.extend(future.result())
+            progress_bar.progress((idx + 1) / total_batches)
 
     return predictions, references
 
@@ -80,7 +112,7 @@ else:
 st.subheader("Evaluation Metrics")
 if st.button("Compute Evaluation Metrics"):
     with st.spinner("Evaluating..."):
-        predictions, references = evaluate_model()
+        predictions, references = evaluate_model(df_test)
         metrics = compute_rouge(predictions, references)
         for metric, value in metrics.items():
             st.metric(label=metric, value=f"{value:.4f}")
